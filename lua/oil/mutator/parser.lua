@@ -37,24 +37,35 @@ local FIELD_META = constants.FIELD_META
 ---@return string
 ---@return boolean
 local function parsedir(name)
-  local isdir = vim.endswith(name, "/") or (fs.is_windows and vim.endswith(name, "\\"))
-  if isdir then
-    name = name:sub(1, name:len() - 1)
-  end
-  return name, isdir
+    local isdir = vim.endswith(name, "/") or (fs.is_windows and vim.endswith(name, "\\"))
+    if isdir then
+        name = name:sub(1, name:len() - 1)
+    end
+    return name, isdir
+end
+
+local function split_nested_path(name)
+    local path_sep = fs.is_windows and "\\" or "/"
+
+    if not name:find(path_sep, 1, true) then
+        return { name }, false
+    end
+
+    local segments = vim.split(name, path_sep, { plain = true, trimempty = true })
+    return segments, true
 end
 
 ---@param meta nil|table
 ---@param parsed_entry table
 ---@return boolean True if metadata and parsed entry have the same link target
 local function compare_link_target(meta, parsed_entry)
-  if not meta or not meta.link then
-    return false
-  end
-  -- Make sure we trim off any trailing path slashes from both sources
-  local meta_name = meta.link:gsub("[/\\]$", "")
-  local parsed_name = parsed_entry.link_target:gsub("[/\\]$", "")
-  return meta_name == parsed_name
+    if not meta or not meta.link then
+        return false
+    end
+    -- Make sure we trim off any trailing path slashes from both sources
+    local meta_name = meta.link:gsub("[/\\]$", "")
+    local parsed_name = parsed_entry.link_target:gsub("[/\\]$", "")
+    return meta_name == parsed_name
 end
 
 ---@class (exact) oil.ParseResult
@@ -69,77 +80,77 @@ end
 ---@return nil|oil.ParseResult
 ---@return nil|string Error
 M.parse_line = function(adapter, line, column_defs)
-  local ret = {}
-  local ranges = {}
-  local start = 1
-  local value, rem = line:match("^/(%d+) (.+)$")
-  if not value then
-    return nil, "Malformed ID at start of line"
-  end
-  ranges.id = { start, value:len() + 1 }
-  start = ranges.id[2] + 1
-  ret.id = tonumber(value)
-
-  -- Right after a mutation and we reset the cache, the parent url may not be available
-  local ok, parent_url = pcall(cache.get_parent_url, ret.id)
-  if ok then
-    -- If this line was pasted from another adapter, it may have different columns
-    local line_adapter = assert(config.get_adapter_by_scheme(parent_url))
-    if adapter ~= line_adapter then
-      adapter = line_adapter
-      column_defs = columns.get_supported_columns(adapter)
+    local ret = {}
+    local ranges = {}
+    local start = 1
+    local value, rem = line:match("^/(%d+) (.+)$")
+    if not value then
+        return nil, "Malformed ID at start of line"
     end
-  end
+    ranges.id = { start, value:len() + 1 }
+    start = ranges.id[2] + 1
+    ret.id = tonumber(value)
 
-  for _, def in ipairs(column_defs) do
-    local name = util.split_config(def)
-    local range = { start }
-    local start_len = string.len(rem)
-    value, rem = columns.parse_col(adapter, rem, def)
-    if not rem then
-      return nil, string.format("Parsing %s failed", name)
+    -- Right after a mutation and we reset the cache, the parent url may not be available
+    local ok, parent_url = pcall(cache.get_parent_url, ret.id)
+    if ok then
+        -- If this line was pasted from another adapter, it may have different columns
+        local line_adapter = assert(config.get_adapter_by_scheme(parent_url))
+        if adapter ~= line_adapter then
+            adapter = line_adapter
+            column_defs = columns.get_supported_columns(adapter)
+        end
     end
-    ret[name] = value
-    range[2] = range[1] + start_len - string.len(rem) - 1
-    ranges[name] = range
-    start = range[2] + 1
-  end
-  local name = rem
-  if name then
-    local isdir
-    name, isdir = parsedir(vim.trim(name))
-    if name ~= "" then
-      ret.name = name
+
+    for _, def in ipairs(column_defs) do
+        local name = util.split_config(def)
+        local range = { start }
+        local start_len = string.len(rem)
+        value, rem = columns.parse_col(adapter, rem, def)
+        if not rem then
+            return nil, string.format("Parsing %s failed", name)
+        end
+        ret[name] = value
+        range[2] = range[1] + start_len - string.len(rem) - 1
+        ranges[name] = range
+        start = range[2] + 1
     end
-    ret._type = isdir and "directory" or "file"
-  end
-  local entry = cache.get_entry_by_id(ret.id)
-  ranges.name = { start, start + string.len(rem) - 1 }
-  if not entry then
-    return { data = ret, ranges = ranges }
-  end
-
-  -- Parse the symlink syntax
-  local meta = entry[FIELD_META]
-  local entry_type = entry[FIELD_TYPE]
-  if entry_type == "link" and meta and meta.link then
-    local name_pieces = vim.split(ret.name, " -> ", { plain = true })
-    if #name_pieces ~= 2 then
-      ret.name = ""
-      return { data = ret, ranges = ranges }
+    local name = rem
+    if name then
+        local isdir
+        name, isdir = parsedir(vim.trim(name))
+        if name ~= "" then
+            ret.name = name
+        end
+        ret._type = isdir and "directory" or "file"
     end
-    ranges.name = { start, start + string.len(name_pieces[1]) - 1 }
-    ret.name = parsedir(vim.trim(name_pieces[1]))
-    ret.link_target = name_pieces[2]
-    ret._type = "link"
-  end
+    local entry = cache.get_entry_by_id(ret.id)
+    ranges.name = { start, start + string.len(rem) - 1 }
+    if not entry then
+        return { data = ret, ranges = ranges }
+    end
 
-  -- Try to keep the same file type
-  if entry_type ~= "directory" and entry_type ~= "file" and ret._type ~= "directory" then
-    ret._type = entry[FIELD_TYPE]
-  end
+    -- Parse the symlink syntax
+    local meta = entry[FIELD_META]
+    local entry_type = entry[FIELD_TYPE]
+    if entry_type == "link" and meta and meta.link then
+        local name_pieces = vim.split(ret.name, " -> ", { plain = true })
+        if #name_pieces ~= 2 then
+            ret.name = ""
+            return { data = ret, ranges = ranges }
+        end
+        ranges.name = { start, start + string.len(name_pieces[1]) - 1 }
+        ret.name = parsedir(vim.trim(name_pieces[1]))
+        ret.link_target = name_pieces[2]
+        ret._type = "link"
+    end
 
-  return { data = ret, entry = entry, ranges = ranges }
+    -- Try to keep the same file type
+    if entry_type ~= "directory" and entry_type ~= "file" and ret._type ~= "directory" then
+        ret._type = entry[FIELD_TYPE]
+    end
+
+    return { data = ret, entry = entry, ranges = ranges }
 end
 
 ---@class (exact) oil.ParseError
@@ -151,171 +162,247 @@ end
 ---@return oil.Diff[] diffs
 ---@return oil.ParseError[] errors Parsing errors
 M.parse = function(bufnr)
-  ---@type oil.Diff[]
-  local diffs = {}
-  ---@type oil.ParseError[]
-  local errors = {}
-  local bufname = vim.api.nvim_buf_get_name(bufnr)
-  local adapter = util.get_adapter(bufnr, true)
-  if not adapter then
-    table.insert(errors, {
-      lnum = 0,
-      col = 0,
-      message = string.format("Cannot parse buffer '%s': No adapter", bufname),
-    })
-    return diffs, errors
-  end
-
-  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
-  local scheme, path = util.parse_url(bufname)
-  local column_defs = columns.get_supported_columns(adapter)
-  local parent_url = scheme .. path
-  local children = cache.list_url(parent_url)
-  -- map from name to entry ID for all entries previously in the buffer
-  ---@type table<string, integer>
-  local original_entries = {}
-  for _, child in pairs(children) do
-    local name = child[FIELD_NAME]
-    if view.should_display(name, bufnr) then
-      original_entries[name] = child[FIELD_ID]
-    end
-  end
-  local seen_names = {}
-  local function check_dupe(name, i)
-    if fs.is_mac or fs.is_windows then
-      -- mac and windows use case-insensitive filesystems
-      name = name:lower()
-    end
-    if seen_names[name] then
-      table.insert(errors, { message = "Duplicate filename", lnum = i - 1, end_lnum = i, col = 0 })
-    else
-      seen_names[name] = true
-    end
-  end
-
-  for i, line in ipairs(lines) do
-    -- hack to be compatible with Lua 5.1
-    -- use return instead of goto
-    (function()
-      if line:match("^/%d+") then
-        -- Parse the line for an existing entry
-        local result, err = M.parse_line(adapter, line, column_defs)
-        if not result or err then
-          table.insert(errors, {
-            message = err,
-            lnum = i - 1,
-            end_lnum = i,
+    ---@type oil.Diff[]
+    local diffs = {}
+    ---@type oil.ParseError[]
+    local errors = {}
+    local bufname = vim.api.nvim_buf_get_name(bufnr)
+    local adapter = util.get_adapter(bufnr, true)
+    if not adapter then
+        table.insert(errors, {
+            lnum = 0,
             col = 0,
-          })
-          return
-        elseif result.data.id == 0 then
-          -- Ignore entries with ID 0 (typically the "../" entry)
-          return
-        end
-        local parsed_entry = result.data
-        local entry = result.entry
+            message = string.format("Cannot parse buffer '%s': No adapter", bufname),
+        })
+        return diffs, errors
+    end
 
-        local err_message
-        if not parsed_entry.name then
-          err_message = "No filename found"
-        elseif not entry then
-          err_message = "Could not find existing entry (was the ID changed?)"
-        elseif parsed_entry.name:match("/") or parsed_entry.name:match(fs.sep) then
-          err_message = "Filename cannot contain path separator"
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
+    local scheme, path = util.parse_url(bufname)
+    local column_defs = columns.get_supported_columns(adapter)
+    local parent_url = scheme .. path
+    local children = cache.list_url(parent_url)
+    -- map from name to entry ID for all entries previously in the buffer
+    ---@type table<string, integer>
+    local original_entries = {}
+    for _, child in pairs(children) do
+        local name = child[FIELD_NAME]
+        if view.should_display(name, bufnr) then
+            original_entries[name] = child[FIELD_ID]
         end
-        if err_message then
-          table.insert(errors, {
-            message = err_message,
-            lnum = i - 1,
-            end_lnum = i,
-            col = 0,
-          })
-          return
+    end
+    local seen_names = {}
+    local function check_dupe(name, i)
+        if fs.is_mac or fs.is_windows then
+            -- mac and windows use case-insensitive filesystems
+            name = name:lower()
         end
-        assert(entry)
-
-        check_dupe(parsed_entry.name, i)
-        local meta = entry[FIELD_META]
-        if original_entries[parsed_entry.name] == parsed_entry.id then
-          if entry[FIELD_TYPE] == "link" and not compare_link_target(meta, parsed_entry) then
-            table.insert(diffs, {
-              type = "new",
-              name = parsed_entry.name,
-              entry_type = "link",
-              link = parsed_entry.link_target,
-            })
-          elseif entry[FIELD_TYPE] ~= parsed_entry._type then
-            table.insert(diffs, {
-              type = "new",
-              name = parsed_entry.name,
-              entry_type = parsed_entry._type,
-            })
-          else
-            original_entries[parsed_entry.name] = nil
-          end
+        if seen_names[name] then
+            table.insert(errors, { message = "Duplicate filename", lnum = i - 1, end_lnum = i, col = 0 })
         else
-          table.insert(diffs, {
-            type = "new",
-            name = parsed_entry.name,
-            entry_type = parsed_entry._type,
-            id = parsed_entry.id,
-            link = parsed_entry.link_target,
-          })
+            seen_names[name] = true
         end
+    end
 
-        for _, col_def in ipairs(column_defs) do
-          local col_name = util.split_config(col_def)
-          if columns.compare(adapter, col_name, entry, parsed_entry[col_name]) then
-            table.insert(diffs, {
-              type = "change",
-              name = parsed_entry.name,
-              entry_type = entry[FIELD_TYPE],
-              column = col_name,
-              value = parsed_entry[col_name],
-            })
-          end
-        end
-      else
-        -- Parse a new entry
-        local name, isdir = parsedir(vim.trim(line))
-        if vim.startswith(name, "/") then
-          table.insert(errors, {
-            message = "Paths cannot start with '/'",
-            lnum = i - 1,
-            end_lnum = i,
-            col = 0,
-          })
-          return
-        end
-        if name ~= "" then
-          local link_pieces = vim.split(name, " -> ", { plain = true })
-          local entry_type = isdir and "directory" or "file"
-          local link
-          if #link_pieces == 2 then
-            entry_type = "link"
-            name, link = unpack(link_pieces)
-          end
-          check_dupe(name, i)
-          table.insert(diffs, {
-            type = "new",
+    for i, line in ipairs(lines) do
+        -- hack to be compatible with Lua 5.1
+        -- use return instead of goto
+        (function()
+            if line:match("^/%d+") then
+                -- Parse the line for an existing entry
+                local result, err = M.parse_line(adapter, line, column_defs)
+                if not result or err then
+                    table.insert(errors, {
+                        message = err,
+                        lnum = i - 1,
+                        end_lnum = i,
+                        col = 0,
+                    })
+                    return
+                elseif result.data.id == 0 then
+                    -- Ignore entries with ID 0 (typically the "../" entry)
+                    return
+                end
+                local parsed_entry = result.data
+                local entry = result.entry
+
+                local err_message
+                local has_path_sep = parsed_entry.name:match("/") or parsed_entry.name:match(fs.sep)
+                if not parsed_entry.name then
+                    err_message = "No filename found"
+                elseif not entry then
+                    err_message = "Could not find existing entry (was the ID changed?)"
+                    --elseif parsed_entry.name:match("/") or parsed_entry.name:match(fs.sep) then
+                    --err_message = "Filename cannot contain path separator"
+                end
+                if err_message then
+                    table.insert(errors, {
+                        message = err_message,
+                        lnum = i - 1,
+                        end_lnum = i,
+                        col = 0,
+                    })
+                    return
+                end
+                assert(entry)
+
+                check_dupe(parsed_entry.name, i)
+                local meta = entry[FIELD_META]
+                if original_entries[parsed_entry.name] == parsed_entry.id then
+                    if entry[FIELD_TYPE] == "link" and not compare_link_target(meta, parsed_entry) then
+                        table.insert(diffs, {
+                            type = "new",
+                            name = parsed_entry.name,
+                            entry_type = "link",
+                            link = parsed_entry.link_target,
+                        })
+                    elseif entry[FIELD_TYPE] ~= parsed_entry._type then
+                        table.insert(diffs, {
+                            type = "new",
+                            name = parsed_entry.name,
+                            entry_type = parsed_entry._type,
+                        })
+                    else
+                        original_entries[parsed_entry.name] = nil
+                    end
+                else
+                    table.insert(diffs, {
+                        type = "new",
+                        name = parsed_entry.name,
+                        entry_type = parsed_entry._type,
+                        id = parsed_entry.id,
+                        link = parsed_entry.link_target,
+                    })
+                end
+
+                for _, col_def in ipairs(column_defs) do
+                    local col_name = util.split_config(col_def)
+                    if columns.compare(adapter, col_name, entry, parsed_entry[col_name]) then
+                        table.insert(diffs, {
+                            type = "change",
+                            name = parsed_entry.name,
+                            entry_type = entry[FIELD_TYPE],
+                            column = col_name,
+                            value = parsed_entry[col_name],
+                        })
+                    end
+                end
+            else
+                -- Parse a new entry
+                local name, isdir = parsedir(vim.trim(line))
+                if vim.startswith(name, "/") then
+                    table.insert(errors, {
+                        message = "Paths cannot start with '/'",
+                        lnum = i - 1,
+                        end_lnum = i,
+                        col = 0,
+                    })
+                    return
+                end
+
+                if name ~= "" then
+                    local segments, is_nested = split_nested_path(name)
+
+                    if is_nested and #segments > 1 then
+                        -- Handle nested paths like "dir/subdir/file.lua"
+
+                        -- Create parent directories
+                        local path_parts = {}
+                        for idx = 1, #segments - 1 do
+                            table.insert(path_parts, segments[idx])
+                            local dir_path = table.concat(path_parts, fs.is_windows and "\\" or "/")
+
+                            -- Check if directory exists
+                            local dir_exists = false
+                            for orig_name, _ in pairs(original_entries) do
+                                if orig_name == segments[idx] and idx == 1 then
+                                    dir_exists = true
+                                    original_entries[orig_name] = nil
+                                    break
+                                end
+                            end
+
+                            if not dir_exists then
+                                table.insert(diffs, {
+                                    type = "new",
+                                    name = dir_path,
+                                    entry_type = "directory",
+                                })
+                            end
+                        end
+
+                        -- Handle the final file/directory
+                        local final_name = segments[#segments]
+                        local final_name_clean, final_isdir = parsedir(final_name)
+
+                        -- Check for symlink syntax
+                        local link_pieces = vim.split(final_name_clean, " -> ", { plain = true })
+                        local entry_type = final_isdir and "directory" or "file"
+                        local link = nil
+
+                        if #link_pieces == 2 then
+                            entry_type = "link"
+                            final_name_clean, link = link_pieces[1], link_pieces[2]
+                        end
+
+                        check_dupe(final_name_clean, i)
+
+                        -- Build full path
+                        segments[#segments] = final_name_clean
+                        local full_path = table.concat(segments, fs.is_windows and "\\" or "/")
+
+                        -- Check if moving existing file
+                        local existing_id = original_entries[final_name_clean]
+                        if existing_id then
+                            -- MOVE operation
+                            table.insert(diffs, {
+                                type = "new",
+                                name = full_path,
+                                entry_type = entry_type,
+                                id = existing_id,
+                                link = link,
+                            })
+                            original_entries[final_name_clean] = nil
+                        else
+                            -- CREATE operation
+                            table.insert(diffs, {
+                                type = "new",
+                                name = full_path,
+                                entry_type = entry_type,
+                                link = link,
+                            })
+                        end
+                    else
+                        -- Simple file/directory creation (original Oil behavior)
+                        local link_pieces = vim.split(name, " -> ", { plain = true })
+                        local entry_type = isdir and "directory" or "file"
+                        local link
+                        if #link_pieces == 2 then
+                            entry_type = "link"
+                            name, link = unpack(link_pieces)
+                        end
+                        check_dupe(name, i)
+                        table.insert(diffs, {
+                            type = "new",
+                            name = name,
+                            entry_type = entry_type,
+                            link = link,
+                        })
+                    end
+                end
+            end
+        end)()
+    end
+
+    for name, child_id in pairs(original_entries) do
+        table.insert(diffs, {
+            type = "delete",
             name = name,
-            entry_type = entry_type,
-            link = link,
-          })
-        end
-      end
-    end)()
-  end
+            id = child_id,
+        })
+    end
 
-  for name, child_id in pairs(original_entries) do
-    table.insert(diffs, {
-      type = "delete",
-      name = name,
-      id = child_id,
-    })
-  end
-
-  return diffs, errors
+    return diffs, errors
 end
 
 return M
