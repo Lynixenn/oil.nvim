@@ -303,39 +303,30 @@ M.parse = function(bufnr)
                 if name ~= "" then
                     local segments, is_nested = split_nested_path(name)
 
+                    -- Safety check
+                    if not segments or #segments == 0 then
+                        return
+                    end
+
                     if is_nested and #segments > 1 then
-                        -- Handle nested paths like "dir/subdir/file.lua"
+                        -- Handle nested paths - let Oil's init.lua create parent directories
 
-                        -- Create parent directories
-                        local path_parts = {}
+                        -- Mark existing parent directories so they don't get deleted
                         for idx = 1, #segments - 1 do
-                            table.insert(path_parts, segments[idx])
-                            local dir_path = table.concat(path_parts, fs.is_windows and "\\" or "/")
-
-                            -- Check if directory exists
-                            local dir_exists = false
-                            for orig_name, _ in pairs(original_entries) do
-                                if orig_name == segments[idx] and idx == 1 then
-                                    dir_exists = true
-                                    original_entries[orig_name] = nil
-                                    break
-                                end
-                            end
-
-                            if not dir_exists then
-                                table.insert(diffs, {
-                                    type = "new",
-                                    name = dir_path,
-                                    entry_type = "directory",
-                                })
+                            local dir_name = segments[idx]
+                            if original_entries[dir_name] then
+                                original_entries[dir_name] = nil
                             end
                         end
 
-                        -- Handle the final file/directory
+                        -- Handle the final file
                         local final_name = segments[#segments]
+                        if not final_name or final_name == "" then
+                            return
+                        end
+
                         local final_name_clean, final_isdir = parsedir(final_name)
 
-                        -- Check for symlink syntax
                         local link_pieces = vim.split(final_name_clean, " -> ", { plain = true })
                         local entry_type = final_isdir and "directory" or "file"
                         local link = nil
@@ -347,14 +338,13 @@ M.parse = function(bufnr)
 
                         check_dupe(final_name_clean, i)
 
-                        -- Build full path
+                        -- Build FULL nested path - Oil will automatically create parent dirs
                         segments[#segments] = final_name_clean
                         local full_path = table.concat(segments, fs.is_windows and "\\" or "/")
 
                         -- Check if moving existing file
                         local existing_id = original_entries[final_name_clean]
                         if existing_id then
-                            -- MOVE operation
                             table.insert(diffs, {
                                 type = "new",
                                 name = full_path,
@@ -364,7 +354,6 @@ M.parse = function(bufnr)
                             })
                             original_entries[final_name_clean] = nil
                         else
-                            -- CREATE operation
                             table.insert(diffs, {
                                 type = "new",
                                 name = full_path,
@@ -373,7 +362,11 @@ M.parse = function(bufnr)
                             })
                         end
                     else
-                        -- Simple file/directory creation (original Oil behavior)
+                        -- Simple file/directory creation
+                        if not name or name == "" then
+                            return
+                        end
+
                         local link_pieces = vim.split(name, " -> ", { plain = true })
                         local entry_type = isdir and "directory" or "file"
                         local link

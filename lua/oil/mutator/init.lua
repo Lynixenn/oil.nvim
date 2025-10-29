@@ -120,12 +120,34 @@ M.create_actions_from_diffs = function(all_diffs)
                             end
                         else
                             url = url .. "/" .. v
-                            add_action({
-                                type = "create",
-                                url = url,
-                                entry_type = entry_type,
-                                link = diff.link,
-                            })
+
+                            -- Skip creating action if this is a non-final directory that already exists
+                            local should_create = true
+                            if not is_last and entry_type == "directory" then
+                                -- Check if this directory URL is in seen_creates (being created this pass)
+                                -- OR if it already exists on disk
+                                if seen_creates[url] then
+                                    should_create = false
+                                else
+                                    -- Check the filesystem to see if directory exists
+                                    local adapter = assert(config.get_adapter_by_scheme(url))
+                                    if adapter.name == "files" then
+                                        local fs_path = vim.fn.fnamemodify(url:gsub("^oil://", ""), ":p")
+                                        if vim.fn.isdirectory(fs_path) == 1 then
+                                            should_create = false
+                                        end
+                                    end
+                                end
+                            end
+
+                            if should_create then
+                                add_action({
+                                    type = "create",
+                                    url = url,
+                                    entry_type = entry_type,
+                                    link = diff.link,
+                                })
+                            end
                         end
                     end
                 end
