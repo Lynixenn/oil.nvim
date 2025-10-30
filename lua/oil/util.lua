@@ -952,6 +952,39 @@ M.get_icon_provider = function()
   end
 end
 
+-- Image format extensions supported for preview
+local IMAGE_EXTENSIONS = {
+  png = true,
+  jpg = true,
+  jpeg = true,
+  gif = true,
+  webp = true,
+  bmp = true,
+  ico = true,
+  tiff = true,
+  tif = true,
+  svg = true,
+  avif = true,
+}
+
+---Check if a file is an image based on extension
+---@param filename string
+---@return boolean
+M.is_image_file = function(filename)
+  local ext = filename:match("%.([^.]+)$")
+  if not ext then
+    return false
+  end
+  return IMAGE_EXTENSIONS[ext:lower()] == true
+end
+
+---Get file extension
+---@param filename string
+---@return string|nil
+M.get_file_extension = function(filename)
+  return filename:match("%.([^.]+)$")
+end
+
 ---Read a buffer into a scratch buffer and apply syntactic highlighting when possible
 ---@param path string The path to the file to read
 ---@param preview_method oil.PreviewMethod

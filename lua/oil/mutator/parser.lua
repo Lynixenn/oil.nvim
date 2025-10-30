@@ -36,6 +36,10 @@ local FIELD_META = constants.FIELD_META
 ---@param name string
 ---@return string
 ---@return boolean
+---Parse a name to determine if it's a directory and remove trailing slashes
+---@param name string
+---@return string cleaned_name The name without trailing slashes
+---@return boolean isdir True if name ends with a directory separator
 local function parsedir(name)
     local isdir = vim.endswith(name, "/") or (fs.is_windows and vim.endswith(name, "\\"))
     if isdir then
@@ -44,15 +48,32 @@ local function parsedir(name)
     return name, isdir
 end
 
-local function split_nested_path(name)
-    local path_sep = fs.is_windows and "\\" or "/"
-
-    if not name:find(path_sep, 1, true) then
-        return { name }, false
+---Parse an entry name into its components (path segments, directory status, link target)
+---This consolidates multiple parsing operations into a single pass for efficiency
+---@param name string The raw entry name (may include path separators and link syntax)
+---@return table parsed_entry Contains: name, isdir, link_target, segments, is_nested
+local function parse_entry_name(name)
+    -- First check if it's a directory
+    local isdir = vim.endswith(name, "/") or (fs.is_windows and vim.endswith(name, "\\"))
+    if isdir then
+        name = name:sub(1, -2)
     end
-
-    local segments = vim.split(name, path_sep, { plain = true, trimempty = true })
-    return segments, true
+    
+    -- Check for symlink syntax
+    local link_pieces = vim.split(name, " -> ", { plain = true })
+    local entry_name = link_pieces[1]
+    local link_target = link_pieces[2]
+    
+    -- Split into path segments
+    local segments, is_nested = fs.split_path(entry_name)
+    
+    return {
+        name = entry_name,
+        isdir = isdir,
+        link_target = link_target,
+        segments = segments,
+        is_nested = is_nested
+    }
 end
 
 ---@param meta nil|table
@@ -227,13 +248,11 @@ M.parse = function(bufnr)
                 local entry = result.entry
 
                 local err_message
-                local has_path_sep = parsed_entry.name:match("/") or parsed_entry.name:match(fs.sep)
-                if not parsed_entry.name then
+                -- Check for missing or empty filename first
+                if not parsed_entry.name or parsed_entry.name == "" then
                     err_message = "No filename found"
                 elseif not entry then
                     err_message = "Could not find existing entry (was the ID changed?)"
-                    --elseif parsed_entry.name:match("/") or parsed_entry.name:match(fs.sep) then
-                    --err_message = "Filename cannot contain path separator"
                 end
                 if err_message then
                     table.insert(errors, {
@@ -289,8 +308,12 @@ M.parse = function(bufnr)
                 end
             else
                 -- Parse a new entry
-                local name, isdir = parsedir(vim.trim(line))
-                if vim.startswith(name, "/") then
+                local trimmed_line = vim.trim(line)
+                if trimmed_line == "" then
+                    return
+                end
+                
+                if vim.startswith(trimmed_line, "/") then
                     table.insert(errors, {
                         message = "Paths cannot start with '/'",
                         lnum = i - 1,
@@ -300,88 +323,69 @@ M.parse = function(bufnr)
                     return
                 end
 
-                if name ~= "" then
-                    local segments, is_nested = split_nested_path(name)
+                -- Use consolidated parser for efficiency
+                local parsed = parse_entry_name(trimmed_line)
+                
+                -- Safety check for empty segments
+                if not parsed.segments or #parsed.segments == 0 then
+                    return
+                end
 
-                    -- Safety check
-                    if not segments or #segments == 0 then
+                -- Determine entry type based on link presence and directory status
+                local entry_type
+                if parsed.link_target then
+                    entry_type = "link"
+                elseif parsed.isdir then
+                    entry_type = "directory"
+                else
+                    entry_type = "file"
+                end
+
+                if parsed.is_nested then
+                    -- Handle nested paths - mark existing parent directories so they don't get deleted
+                    for idx = 1, #parsed.segments - 1 do
+                        local dir_name = parsed.segments[idx]
+                        if original_entries[dir_name] then
+                            original_entries[dir_name] = nil
+                        end
+                    end
+
+                    -- Get the final segment name
+                    local final_name = parsed.segments[#parsed.segments]
+                    if not final_name or final_name == "" then
                         return
                     end
 
-                    if is_nested and #segments > 1 then
-                        -- Handle nested paths - let Oil's init.lua create parent directories
+                    check_dupe(final_name, i)
 
-                        -- Mark existing parent directories so they don't get deleted
-                        for idx = 1, #segments - 1 do
-                            local dir_name = segments[idx]
-                            if original_entries[dir_name] then
-                                original_entries[dir_name] = nil
-                            end
-                        end
+                    -- Build full nested path - Oil will automatically create parent dirs
+                    local full_path = table.concat(parsed.segments, fs.sep)
+                    
+                    -- Normalize path to handle .. and . components
+                    full_path = vim.fs.normalize(full_path)
 
-                        -- Handle the final file
-                        local final_name = segments[#segments]
-                        if not final_name or final_name == "" then
-                            return
-                        end
-
-                        local final_name_clean, final_isdir = parsedir(final_name)
-
-                        local link_pieces = vim.split(final_name_clean, " -> ", { plain = true })
-                        local entry_type = final_isdir and "directory" or "file"
-                        local link = nil
-
-                        if #link_pieces == 2 then
-                            entry_type = "link"
-                            final_name_clean, link = link_pieces[1], link_pieces[2]
-                        end
-
-                        check_dupe(final_name_clean, i)
-
-                        -- Build FULL nested path - Oil will automatically create parent dirs
-                        segments[#segments] = final_name_clean
-                        local full_path = table.concat(segments, fs.is_windows and "\\" or "/")
-
-                        -- Check if moving existing file
-                        local existing_id = original_entries[final_name_clean]
-                        if existing_id then
-                            table.insert(diffs, {
-                                type = "new",
-                                name = full_path,
-                                entry_type = entry_type,
-                                id = existing_id,
-                                link = link,
-                            })
-                            original_entries[final_name_clean] = nil
-                        else
-                            table.insert(diffs, {
-                                type = "new",
-                                name = full_path,
-                                entry_type = entry_type,
-                                link = link,
-                            })
-                        end
-                    else
-                        -- Simple file/directory creation
-                        if not name or name == "" then
-                            return
-                        end
-
-                        local link_pieces = vim.split(name, " -> ", { plain = true })
-                        local entry_type = isdir and "directory" or "file"
-                        local link
-                        if #link_pieces == 2 then
-                            entry_type = "link"
-                            name, link = unpack(link_pieces)
-                        end
-                        check_dupe(name, i)
-                        table.insert(diffs, {
-                            type = "new",
-                            name = name,
-                            entry_type = entry_type,
-                            link = link,
-                        })
+                    -- Check if moving an existing file
+                    local existing_id = original_entries[final_name]
+                    table.insert(diffs, {
+                        type = "new",
+                        name = full_path,
+                        entry_type = entry_type,
+                        id = existing_id,
+                        link = parsed.link_target,
+                    })
+                    
+                    if existing_id then
+                        original_entries[final_name] = nil
                     end
+                else
+                    -- Simple file/directory creation (single segment path)
+                    check_dupe(parsed.name, i)
+                    table.insert(diffs, {
+                        type = "new",
+                        name = parsed.name,
+                        entry_type = entry_type,
+                        link = parsed.link_target,
+                    })
                 end
             end
         end)()

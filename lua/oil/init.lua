@@ -555,7 +555,16 @@ M.open_preview = function(opts, callback)
     local entry_is_file = not vim.endswith(normalized_url, "/")
     local filebufnr
     if entry_is_file then
-      if config.preview_win.disable_preview(normalized_url) then
+      -- Check if this is an image file
+      local is_image = util.is_image_file(normalized_url)
+      if is_image then
+        -- Image file - show info
+        local image_info = require("oil.preview.image_info")
+        filebufnr = vim.api.nvim_create_buf(false, true)
+        vim.bo[filebufnr].bufhidden = "wipe"
+        vim.bo[filebufnr].buftype = "nofile"
+        image_info.display_image_info(filebufnr, normalized_url)
+      elseif config.preview_win.disable_preview(normalized_url) then
         filebufnr = vim.api.nvim_create_buf(false, true)
         vim.bo[filebufnr].bufhidden = "wipe"
         vim.bo[filebufnr].buftype = "nofile"

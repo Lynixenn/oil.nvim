@@ -13,6 +13,22 @@ M.is_linux = not M.is_windows and not M.is_mac
 ---@type string
 M.sep = M.is_windows and "\\" or "/"
 
+---Get path separator pattern for use in string matching/splitting
+---@return string Pattern that matches both forward and backslash on Windows, just forward slash elsewhere
+M.get_path_separator_pattern = function()
+  return M.is_windows and "[/\\]" or "/"
+end
+
+---Split a path into segments using the appropriate separator
+---@param path string The path to split
+---@return string[] segments The path segments (empty segments are removed)
+---@return boolean is_nested True if the path contains more than one segment
+M.split_path = function(path)
+  local pattern = M.get_path_separator_pattern()
+  local segments = vim.split(path, pattern, { plain = true, trimempty = true })
+  return segments, #segments > 1
+end
+
 ---@param ... string
 M.join = function(...)
   return table.concat({ ... }, M.sep)

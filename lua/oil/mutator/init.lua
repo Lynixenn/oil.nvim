@@ -94,14 +94,21 @@ M.create_actions_from_diffs = function(all_diffs)
             if diff.type == "new" then
                 if diff.id then
                     local by_id = diff_by_id[diff.id]
-                    ---HACK: set the destination on this diff for use later
+                    -- Store destination URL on diff for move/copy action construction
+                    -- This allows us to track where an existing entry is being moved/copied to
+                    -- Normalize to resolve relative path components like '..'
+                    local dest_path = parent_url .. diff.name
+                    local scheme, path = util.parse_url(dest_path)
+                    if path then
+                        path = vim.fs.normalize(path)
+                        dest_path = scheme .. path
+                    end
                     ---@diagnostic disable-next-line: inject-field
-                    diff.dest = parent_url .. diff.name
+                    diff.dest = dest_path
                     table.insert(by_id, diff)
                 else
-                    -- Parse nested files like foo/bar/baz
-                    local path_sep = fs.is_windows and "[/\\]" or "/"
-                    local pieces = vim.split(diff.name, path_sep)
+                    -- Parse nested files like foo/bar/baz using optimized path utilities
+                    local pieces = fs.split_path(diff.name)
                     local url = parent_url:gsub("/$", "")
                     for i, v in ipairs(pieces) do
                         local is_last = i == #pieces
@@ -121,15 +128,14 @@ M.create_actions_from_diffs = function(all_diffs)
                         else
                             url = url .. "/" .. v
 
-                            -- Skip creating action if this is a non-final directory that already exists
+                            -- Skip creating action if this is an intermediate directory that already exists
                             local should_create = true
                             if not is_last and entry_type == "directory" then
                                 -- Check if this directory URL is in seen_creates (being created this pass)
-                                -- OR if it already exists on disk
                                 if seen_creates[url] then
                                     should_create = false
                                 else
-                                    -- Check the filesystem to see if directory exists
+                                    -- Check the filesystem to see if directory already exists
                                     local adapter = assert(config.get_adapter_by_scheme(url))
                                     if adapter.name == "files" then
                                         local fs_path = vim.fn.fnamemodify(url:gsub("^oil://", ""), ":p")
@@ -161,11 +167,12 @@ M.create_actions_from_diffs = function(all_diffs)
                 })
             else
                 local by_id = diff_by_id[diff.id]
-                -- HACK: set has_delete field on a list-like table of diffs
+                -- Mark that this entry has a delete operation pending
+                -- We use this to differentiate MOVE (delete + new) from COPY (just new)
                 ---@diagnostic disable-next-line: inject-field
                 by_id.has_delete = true
-                -- Don't insert the delete. We already know that there is a delete because of the presence
-                -- in the diff_by_id map. The list will only include the 'new' diffs.
+                -- Don't insert the delete diff - we only track new destinations for this entry
+                -- The presence in diff_by_id already indicates a delete is occurring
             end
         end
     end
@@ -173,9 +180,9 @@ M.create_actions_from_diffs = function(all_diffs)
     for id, diffs in pairs(diff_by_id) do
         local entry = cache.get_entry_by_id(id)
         if not entry then
-            error(string.format("Could not find entry %d", id))
+            error(string.format("Could not find entry with ID %d in cache", id))
         end
-        ---HACK: access the has_delete field on the list-like table of diffs
+        -- Check if this entry has both delete and create operations (indicating a move/copy)
         ---@diagnostic disable-next-line: undefined-field
         if diffs.has_delete then
             local has_create = #diffs > 0
@@ -185,7 +192,7 @@ M.create_actions_from_diffs = function(all_diffs)
                     add_action({
                         type = i == #diffs and "move" or "copy",
                         entry_type = entry[FIELD_TYPE],
-                        ---HACK: access the dest field we set above
+                        -- Use the destination URL we stored earlier on the diff
                         ---@diagnostic disable-next-line: undefined-field
                         dest_url = diff.dest,
                         src_url = cache.get_parent_url(id) .. entry[FIELD_NAME],
@@ -206,7 +213,7 @@ M.create_actions_from_diffs = function(all_diffs)
                     type = "copy",
                     entry_type = entry[FIELD_TYPE],
                     src_url = cache.get_parent_url(id) .. entry[FIELD_NAME],
-                    ---HACK: access the dest field we set above
+                    -- Use the destination URL we stored earlier on the diff
                     ---@diagnostic disable-next-line: undefined-field
                     dest_url = diff.dest,
                 })
@@ -217,9 +224,25 @@ M.create_actions_from_diffs = function(all_diffs)
     return M.enforce_action_order(actions)
 end
 
----@param actions oil.Action[]
----@return oil.Action[]
+---Enforce proper ordering of file operations to prevent conflicts
+---
+---This function implements a topological sort with cycle detection for file operations.
+---It ensures operations are executed in the correct order by:
+---1. Building dependency relationships between actions (e.g., create parent before child)
+---2. Detecting and resolving cycles (e.g., swap operations: mv A->B, mv B->A)
+---3. Returning actions in dependency order (leaves first, then parents)
+---
+---Algorithm overview:
+---1. Build two tries: src_trie (for sources) and dest_trie (for destinations)
+---2. For each action, dynamically compute dependencies using trie queries
+---3. Find leaf actions (no dependencies) and add them to result
+---4. If a cycle is detected, split one move into two temporary moves
+---5. Repeat until all actions are processed
+---
+---@param actions oil.Action[] Unordered list of file operations
+---@return oil.Action[] Ordered list where dependencies are satisfied
 M.enforce_action_order = function(actions)
+    -- Build spatial indices using tries for efficient parent/child queries
     local src_trie = Trie.new()
     local dest_trie = Trie.new()
     for _, action in ipairs(actions) do
@@ -228,21 +251,19 @@ M.enforce_action_order = function(actions)
         elseif action.type == "create" then
             dest_trie:insert_action(action.url, action)
         else
+            -- Move/copy operations affect both source and destination
             dest_trie:insert_action(action.dest_url, action)
             src_trie:insert_action(action.src_url, action)
         end
     end
 
-    -- 1. create a graph, each node points to all of its dependencies
-    -- 2. for each action, if not added, find it in the graph
-    -- 3. traverse through the graph until you reach a node that has no dependencies (leaf)
-    -- 4. append that action to the return value, and remove it from the graph
-    --   a. TODO optimization: check immediate parents to see if they have no dependencies now
-    -- 5. repeat
-
-    ---Gets the dependencies of a particular action. Effectively dynamically calculates the dependency
-    ---"edges" of the graph.
+    ---Dynamically compute dependencies for an action by querying the tries
+    ---Dependencies ensure operations happen in the correct order, e.g.:
+    ---  - Create parent directories before children
+    ---  - Move children out before deleting parent
+    ---  - Delete/move source before creating at same destination
     ---@param action oil.Action
+    ---@return oil.Action[] List of actions that must complete before this one
     local function get_deps(action)
         local ret = {}
         if action.type == "delete" then
@@ -300,31 +321,42 @@ M.enforce_action_order = function(actions)
         return ret
     end
 
-    ---@return nil|oil.Action The leaf action
-    ---@return nil|oil.Action When no leaves found, this is the last action in the loop
+    ---Find a leaf action (one with no dependencies) by traversing the dependency graph
+    ---Uses depth-first search with cycle detection
+    ---@param action oil.Action The action to start searching from
+    ---@param seen? table<oil.Action, boolean> Tracks visited actions to detect cycles
+    ---@return nil|oil.Action leaf The leaf action if found (has no dependencies)
+    ---@return nil|oil.Action loop_action If no leaf found, returns an action involved in a cycle
     local function find_leaf(action, seen)
         if not seen then
             seen = {}
         elseif seen[action] then
+            -- We've visited this action before - we're in a cycle
             return nil, action
         end
         seen[action] = true
+        
         local deps = get_deps(action)
         if vim.tbl_isempty(deps) then
+            -- No dependencies - this is a leaf action, can execute immediately
             return action
         end
+        
+        -- Recursively search dependencies for a leaf
         local action_in_loop
         for _, dep in ipairs(deps) do
             local leaf, loop_action = find_leaf(dep, seen)
             if leaf then
                 return leaf
             elseif not action_in_loop and loop_action then
+                -- Track one action from the cycle for later resolution
                 action_in_loop = loop_action
             end
         end
         return nil, action_in_loop
     end
 
+    -- Main loop: process actions in dependency order
     local ret = {}
     local after = {}
     while not vim.tbl_isempty(actions) do
@@ -335,13 +367,19 @@ M.enforce_action_order = function(actions)
             to_remove = selected
         else
             if loop_action and loop_action.type == "move" then
-                -- If this is moving a parent into itself, that's an error
+                -- Validate cycle is not a parent-into-child move (impossible operation)
                 if vim.startswith(loop_action.dest_url, loop_action.src_url) then
-                    error("Detected cycle in desired paths")
+                    error(string.format(
+                        "Cannot move parent directory into itself: %s -> %s",
+                        loop_action.src_url,
+                        loop_action.dest_url
+                    ))
                 end
 
-                -- We've detected a move cycle (e.g. MOVE /a -> /b + MOVE /b -> /a)
-                -- Split one of the moves and retry
+                -- Detected a move cycle (e.g., MOVE /a -> /b AND MOVE /b -> /a)
+                -- Resolve by splitting one move into two operations via a temporary location:
+                --   Original: MOVE /a -> /b
+                --   Split into: MOVE /a -> /a__oil_tmp_12345, then MOVE /a__oil_tmp_12345 -> /b
                 local intermediate_url =
                     string.format("%s__oil_tmp_%05d", loop_action.src_url, math.random(999999))
                 local move_1 = {
@@ -359,19 +397,25 @@ M.enforce_action_order = function(actions)
                 to_remove = loop_action
                 table.insert(actions, move_1)
                 table.insert(after, move_2)
+                -- Register the temporary move in our tries for dependency tracking
                 dest_trie:insert_action(move_1.dest_url, move_1)
                 src_trie:insert_action(move_1.src_url, move_1)
             else
-                error("Detected cycle in desired paths")
+                error(string.format(
+                    "Detected unresolvable cycle in file operations. Action type: %s",
+                    loop_action and loop_action.type or "unknown"
+                ))
             end
         end
 
         if selected then
+            -- Validate selected action doesn't try to move/copy parent into child
             if selected.type == "move" or selected.type == "copy" then
                 if vim.startswith(selected.dest_url, selected.src_url .. "/") then
                     error(
                         string.format(
-                            "Cannot move or copy parent into itself: %s -> %s",
+                            "Invalid %s operation: cannot move parent directory into its own subdirectory (%s -> %s)",
+                            selected.type:upper(),
                             selected.src_url,
                             selected.dest_url
                         )
@@ -381,6 +425,7 @@ M.enforce_action_order = function(actions)
             table.insert(ret, selected)
         end
 
+        -- Remove processed action from tries and action list
         if to_remove then
             if to_remove.type == "delete" or to_remove.type == "change" then
                 src_trie:remove_action(to_remove.url, to_remove)

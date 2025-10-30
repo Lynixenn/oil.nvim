@@ -56,8 +56,13 @@ end
 
 ---@param path_pieces string[]
 ---@param value any
+---Remove a value from the trie at the specified path
+---@param path_pieces string[]
+---@param value any
 function Trie:remove(path_pieces, value)
   local current = self.root
+  -- Navigate to the target node, creating path if it doesn't exist
+  -- This is necessary because we might be removing from a path that was only partially created
   for _, piece in ipairs(path_pieces) do
     local next_container = current.children[piece]
     if not next_container then
@@ -66,16 +71,17 @@ function Trie:remove(path_pieces, value)
     end
     current = next_container
   end
+  
+  -- Find and remove the value from the values list
   for i, v in ipairs(current.values) do
     if v == value then
       table.remove(current.values, i)
-      -- if vim.tbl_isempty(current.values) and vim.tbl_isempty(current.children) then
-      --   TODO remove container from trie
-      -- end
+      -- Note: We don't remove empty containers from the trie for simplicity
+      -- The memory overhead is minimal and removing would require tracking parent nodes
       return
     end
   end
-  error("Value not present in trie: " .. vim.inspect(value))
+  error("Value not present in trie at path: " .. table.concat(path_pieces, "/"))
 end
 
 ---Add the first action that affects a parent path of the url
@@ -100,7 +106,11 @@ function Trie:accum_first_parents_of(url, ret)
 end
 
 ---Do a depth-first-search and add all children matching the filter
+---@param container table The trie node to search from
+---@param ret table[] Accumulator for matching actions
+---@param filter? fun(action: oil.Action): boolean Optional filter function
 function Trie:_dfs(container, ret, filter)
+  -- Add values from current node if they match the filter
   if filter then
     for _, action in ipairs(container.values) do
       if filter(action) then
@@ -108,10 +118,13 @@ function Trie:_dfs(container, ret, filter)
       end
     end
   else
+    -- No filter: add all values efficiently
     vim.list_extend(ret, container.values)
   end
-  for _, child in ipairs(container.children) do
-    self:_dfs(child, ret)
+  
+  -- Recursively search all child nodes
+  for _, child in pairs(container.children) do
+    self:_dfs(child, ret, filter)
   end
 end
 
